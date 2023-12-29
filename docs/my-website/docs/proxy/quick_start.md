@@ -14,6 +14,9 @@ LiteLLM Server manages:
 [**See LiteLLM Proxy code**](https://github.com/BerriAI/litellm/tree/main/litellm/proxy)
 
 
+#### 📖 Proxy Endpoints - [Swagger Docs](https://litellm-api.up.railway.app/)
+
+
 View all the supported args for the Proxy CLI [here](https://docs.litellm.ai/docs/simple_proxy#proxy-cli-arguments)
 
 ```shell
@@ -43,7 +46,7 @@ litellm --test
 
 This will now automatically route any requests for gpt-3.5-turbo to bigcode starcoder, hosted on huggingface inference endpoints. 
 
-### Using LiteLLM Proxy - Curl Request, OpenAI Package, Langchain, Langchain JS
+### Using LiteLLM Proxy - Curl Request, OpenAI Package, Langchain
 
 <Tabs>
 <TabItem value="Curl" label="Curl Request">
@@ -198,6 +201,19 @@ $ export OPENAI_API_KEY=my-api-key
 $ litellm --model openai/<your model name> --api_base <your-api-base> # e.g. http://0.0.0.0:3000
 ```
 </TabItem>
+
+<TabItem value="vertex-ai" label="Vertex AI [Gemini]">
+
+```shell
+$ export VERTEX_PROJECT="hardy-project"
+$ export VERTEX_LOCATION="us-west"
+```
+
+```shell
+$ litellm --model vertex_ai/gemini-pro
+```
+</TabItem>
+
 <TabItem value="huggingface" label="Huggingface (TGI) Deployed">
 
 ```shell
@@ -348,7 +364,9 @@ litellm --config your_config.yaml
 
 [**More Info**](./configs.md)
 
-## Server Endpoints
+
+
+## 📖 Proxy Endpoints - [Swagger Docs](https://litellm-api.up.railway.app/)
 - POST `/chat/completions` - chat completions endpoint to call 100+ LLMs
 - POST `/completions` - completions endpoint
 - POST `/embeddings` - embedding endpoint for Azure, OpenAI, Huggingface endpoints
@@ -370,12 +388,12 @@ See the latest available ghcr docker image here:
 https://github.com/berriai/litellm/pkgs/container/litellm
 
 ```shell
-docker pull ghcr.io/berriai/litellm:main-v1.10.1
+docker pull ghcr.io/berriai/litellm:main-latest
 ```
 
 ### Run the Docker Image
 ```shell
-docker run ghcr.io/berriai/litellm:main-v1.10.0
+docker run ghcr.io/berriai/litellm:main-latest
 ```
 
 #### Run the Docker Image with LiteLLM CLI args
@@ -384,12 +402,12 @@ See all supported CLI args [here](https://docs.litellm.ai/docs/proxy/cli):
 
 Here's how you can run the docker image and pass your config to `litellm`
 ```shell
-docker run ghcr.io/berriai/litellm:main-v1.10.0 --config your_config.yaml
+docker run ghcr.io/berriai/litellm:main-latest --config your_config.yaml
 ```
 
 Here's how you can run the docker image and start litellm on port 8002 with `num_workers=8`
 ```shell
-docker run ghcr.io/berriai/litellm:main-v1.10.0 --port 8002 --num_workers 8
+docker run ghcr.io/berriai/litellm:main-latest --port 8002 --num_workers 8
 ```
   
 #### Run the Docker Image using docker compose

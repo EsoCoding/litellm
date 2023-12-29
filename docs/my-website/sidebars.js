@@ -43,11 +43,12 @@ const sidebars = {
     },
     {
       type: "category",
-      label: "Embedding() & Moderation()",
+      label: "Embedding(), Moderation(), Image Generation()",
       items: [
         "embedding/supported_embedding", 
         "embedding/async_embedding",
         "embedding/moderation",
+        "image_generation"
       ],
     },
     {
@@ -80,6 +81,7 @@ const sidebars = {
         "providers/replicate", 
         "providers/cohere", 
         "providers/togetherai", 
+        "providers/voyage", 
         "providers/aleph_alpha", 
         "providers/baseten", 
         "providers/openrouter", 
@@ -102,11 +104,14 @@ const sidebars = {
         "proxy/embedding", 
         "proxy/load_balancing", 
         "proxy/virtual_keys",
+        "proxy/user_keys",
+        "proxy/users",
         "proxy/model_management",
         "proxy/reliability",
         "proxy/health",
         "proxy/call_hooks",
         "proxy/caching",
+        "proxy/streaming_logging",
         "proxy/logging", 
         "proxy/cli", 
         "proxy/deploy", 

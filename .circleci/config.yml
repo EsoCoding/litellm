@@ -2,7 +2,7 @@ version: 2.1
 jobs:
   local_testing:
     docker:
-      - image: circleci/python:3.8
+      - image: circleci/python:3.9
     working_directory: ~/project
 
     steps:
@@ -28,21 +28,26 @@ jobs:
             pip install pytest
             pip install pytest-asyncio
             pip install mypy
-            pip install -q google-generativeai
-            pip install google-cloud-aiplatform
+            pip install "google-generativeai>=0.3.2"
+            pip install "google-cloud-aiplatform>=1.38.0"
             pip install "boto3>=1.28.57"
-            pip install appdirs
             pip install langchain
-            pip install langfuse
+            pip install "langfuse>=2.0.0"
             pip install numpydoc
             pip install traceloop-sdk==0.0.69
             pip install openai
             pip install prisma
-            pip install langfuse
       - save_cache:
           paths:
             - ./venv
           key: v1-dependencies-{{ checksum ".circleci/requirements.txt" }}
+      - run:
+          name: Black Formatting
+          command: |
+            cd litellm
+            python -m pip install black
+            python -m black .
+            cd ..
       - run:
           name: Linting Testing
           command: |
@@ -126,6 +131,14 @@ jobs:
                 echo "Version ${VERSION} of package is already published on PyPI. Skipping PyPI publish."
                 circleci step halt
             fi
+      - run:
+          name: Trigger Github Action for new Docker Container
+          command: |
+            curl -X POST \
+              -H "Accept: application/vnd.github.v3+json" \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/BerriAI/litellm/actions/workflows/ghcr_deploy.yml/dispatches" \
+              -d '{"ref":"main"}'
 
 workflows:
   version: 2
