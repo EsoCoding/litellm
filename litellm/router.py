@@ -18,10 +18,13 @@ import inspect, concurrent
 from openai import AsyncOpenAI
 from collections import defaultdict
 from litellm.router_strategy.least_busy import LeastBusyLoggingHandler
+from litellm.router_strategy.lowest_tpm_rpm import LowestTPMLoggingHandler
+from litellm.router_strategy.lowest_latency import LowestLatencyLoggingHandler
 from litellm.llms.custom_httpx.azure_dall_e_2 import (
     CustomHTTPTransport,
     AsyncCustomHTTPTransport,
 )
+from litellm.utils import ModelResponse, CustomStreamWrapper
 import copy
 
 
@@ -67,6 +70,7 @@ class Router:
     num_retries: int = 0
     tenacity = None
     leastbusy_logger: Optional[LeastBusyLoggingHandler] = None
+    lowesttpm_logger: Optional[LowestTPMLoggingHandler] = None
 
     def __init__(
         self,
@@ -81,6 +85,7 @@ class Router:
         caching_groups: Optional[
             List[tuple]
         ] = None,  # if you want to cache across model groups
+        client_ttl: int = 3600,  # ttl for cached clients - will re-initialize after this time in seconds
         ## RELIABILITY ##
         num_retries: int = 0,
         timeout: Optional[float] = None,
@@ -90,6 +95,7 @@ class Router:
         allowed_fails: Optional[int] = None,
         context_window_fallbacks: List = [],
         model_group_alias: Optional[dict] = {},
+        retry_after: int = 0,  # min time to wait before retrying a failed request
         routing_strategy: Literal[
             "simple-shuffle",
             "least-busy",
@@ -102,6 +108,43 @@ class Router:
             []
         )  # names of models under litellm_params. ex. azure/chatgpt-v-2
         self.deployment_latency_map = {}
+        ### CACHING ###
+        cache_type: Literal["local", "redis"] = "local"  # default to an in-memory cache
+        redis_cache = None
+        cache_config = {}
+        self.client_ttl = client_ttl
+        if redis_url is not None or (
+            redis_host is not None
+            and redis_port is not None
+            and redis_password is not None
+        ):
+            cache_type = "redis"
+
+            if redis_url is not None:
+                cache_config["url"] = redis_url
+
+            if redis_host is not None:
+                cache_config["host"] = redis_host
+
+            if redis_port is not None:
+                cache_config["port"] = str(redis_port)  # type: ignore
+
+            if redis_password is not None:
+                cache_config["password"] = redis_password
+
+            # Add additional key-value pairs from cache_kwargs
+            cache_config.update(cache_kwargs)
+            redis_cache = RedisCache(**cache_config)
+
+        if cache_responses:
+            if litellm.cache is None:
+                # the cache can be initialized on the proxy server. We should not overwrite it
+                litellm.cache = litellm.Cache(type=cache_type, **cache_config)  # type: ignore
+            self.cache_responses = cache_responses
+        self.cache = DualCache(
+            redis_cache=redis_cache, in_memory_cache=InMemoryCache()
+        )  # use a dual cache (Redis+In-Memory) for tracking cooldowns, usage, etc.
+
         if model_list:
             model_list = copy.deepcopy(model_list)
             self.set_model_list(model_list)
@@ -115,6 +158,7 @@ class Router:
         )  # cache to track failed call per deployment, if num failed calls within 1 minute > allowed fails, then add it to cooldown
         self.num_retries = num_retries or litellm.num_retries or 0
         self.timeout = timeout or litellm.request_timeout
+        self.retry_after = retry_after
         self.routing_strategy = routing_strategy
         self.fallbacks = fallbacks or litellm.fallbacks
         self.context_window_fallbacks = (
@@ -150,43 +194,11 @@ class Router:
             {"caching_groups": caching_groups}
         )
 
-        ### CACHING ###
-        cache_type: Literal["local", "redis"] = "local"  # default to an in-memory cache
-        redis_cache = None
-        cache_config = {}
-        if redis_url is not None or (
-            redis_host is not None
-            and redis_port is not None
-            and redis_password is not None
-        ):
-            cache_type = "redis"
-
-            if redis_url is not None:
-                cache_config["url"] = redis_url
-
-            if redis_host is not None:
-                cache_config["host"] = redis_host
-
-            if redis_port is not None:
-                cache_config["port"] = str(redis_port)  # type: ignore
-
-            if redis_password is not None:
-                cache_config["password"] = redis_password
-
-            # Add additional key-value pairs from cache_kwargs
-            cache_config.update(cache_kwargs)
-            redis_cache = RedisCache(**cache_config)
-        if cache_responses:
-            if litellm.cache is None:
-                # the cache can be initialized on the proxy server. We should not overwrite it
-                litellm.cache = litellm.Cache(type=cache_type, **cache_config)  # type: ignore
-            self.cache_responses = cache_responses
-        self.cache = DualCache(
-            redis_cache=redis_cache, in_memory_cache=InMemoryCache()
-        )  # use a dual cache (Redis+In-Memory) for tracking cooldowns, usage, etc.
         ### ROUTING SETUP ###
         if routing_strategy == "least-busy":
-            self.leastbusy_logger = LeastBusyLoggingHandler(router_cache=self.cache)
+            self.leastbusy_logger = LeastBusyLoggingHandler(
+                router_cache=self.cache, model_list=self.model_list
+            )
             ## add callback
             if isinstance(litellm.input_callback, list):
                 litellm.input_callback.append(self.leastbusy_logger)  # type: ignore
@@ -194,12 +206,19 @@ class Router:
                 litellm.input_callback = [self.leastbusy_logger]  # type: ignore
             if isinstance(litellm.callbacks, list):
                 litellm.callbacks.append(self.leastbusy_logger)  # type: ignore
-        ## USAGE TRACKING ##
-        if isinstance(litellm.success_callback, list):
-            litellm.success_callback.append(self.deployment_callback)
-        else:
-            litellm.success_callback = [self.deployment_callback]
-
+        elif routing_strategy == "usage-based-routing":
+            self.lowesttpm_logger = LowestTPMLoggingHandler(
+                router_cache=self.cache, model_list=self.model_list
+            )
+            if isinstance(litellm.callbacks, list):
+                litellm.callbacks.append(self.lowesttpm_logger)  # type: ignore
+        elif routing_strategy == "latency-based-routing":
+            self.lowestlatency_logger = LowestLatencyLoggingHandler(
+                router_cache=self.cache, model_list=self.model_list
+            )
+            if isinstance(litellm.callbacks, list):
+                litellm.callbacks.append(self.lowestlatency_logger)  # type: ignore
+        ## COOLDOWNS ##
         if isinstance(litellm.failure_callback, list):
             litellm.failure_callback.append(self.deployment_callback_on_failure)
         else:
@@ -210,7 +229,9 @@ class Router:
 
     ### COMPLETION, EMBEDDING, IMG GENERATION FUNCTIONS
 
-    def completion(self, model: str, messages: List[Dict[str, str]], **kwargs):
+    def completion(
+        self, model: str, messages: List[Dict[str, str]], **kwargs
+    ) -> Union[ModelResponse, CustomStreamWrapper]:
         """
         Example usage:
         response = router.completion(model="gpt-3.5-turbo", messages=[{"role": "user", "content": "Hey, how's it going?"}]
@@ -285,7 +306,7 @@ class Router:
             kwargs["num_retries"] = kwargs.get("num_retries", self.num_retries)
             timeout = kwargs.get("request_timeout", self.timeout)
             kwargs.setdefault("metadata", {}).update({"model_group": model})
-            # response = await asyncio.wait_for(self.async_function_with_fallbacks(**kwargs), timeout=timeout)
+
             response = await self.async_function_with_fallbacks(**kwargs)
 
             return response
@@ -293,6 +314,7 @@ class Router:
             raise e
 
     async def _acompletion(self, model: str, messages: List[Dict[str, str]], **kwargs):
+        model_name = None
         try:
             self.print_verbose(
                 f"Inside _acompletion()- model: {model}; kwargs: {kwargs}"
@@ -330,14 +352,17 @@ class Router:
             else:
                 model_client = potential_model_client
             self.total_calls[model_name] += 1
-            response = await litellm.acompletion(
-                **{
-                    **data,
-                    "messages": messages,
-                    "caching": self.cache_responses,
-                    "client": model_client,
-                    **kwargs,
-                }
+            response = await asyncio.wait_for(
+                litellm.acompletion(
+                    **{
+                        **data,
+                        "messages": messages,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                ),
+                timeout=self.timeout,
             )
             self.success_calls[model_name] += 1
             return response
@@ -494,7 +519,13 @@ class Router:
         **kwargs,
     ):
         try:
+            kwargs["model"] = model
+            kwargs["prompt"] = prompt
+            kwargs["original_function"] = self._acompletion
+            kwargs["num_retries"] = kwargs.get("num_retries", self.num_retries)
+            timeout = kwargs.get("request_timeout", self.timeout)
             kwargs.setdefault("metadata", {}).update({"model_group": model})
+
             messages = [{"role": "user", "content": prompt}]
             # pick the one that is available (lowest TPM/RPM)
             deployment = self.get_available_deployment(
@@ -518,7 +549,6 @@ class Router:
             if self.num_retries > 0:
                 kwargs["model"] = model
                 kwargs["messages"] = messages
-                kwargs["original_exception"] = e
                 kwargs["original_function"] = self.completion
                 return self.function_with_retries(**kwargs)
             else:
@@ -534,16 +564,34 @@ class Router:
         **kwargs,
     ):
         try:
+            kwargs["model"] = model
+            kwargs["prompt"] = prompt
+            kwargs["original_function"] = self._atext_completion
+            kwargs["num_retries"] = kwargs.get("num_retries", self.num_retries)
+            timeout = kwargs.get("request_timeout", self.timeout)
             kwargs.setdefault("metadata", {}).update({"model_group": model})
-            messages = [{"role": "user", "content": prompt}]
-            # pick the one that is available (lowest TPM/RPM)
+            response = await self.async_function_with_fallbacks(**kwargs)
+
+            return response
+        except Exception as e:
+            raise e
+
+    async def _atext_completion(self, model: str, prompt: str, **kwargs):
+        try:
+            self.print_verbose(
+                f"Inside _atext_completion()- model: {model}; kwargs: {kwargs}"
+            )
             deployment = self.get_available_deployment(
                 model=model,
-                messages=messages,
+                messages=[{"role": "user", "content": prompt}],
                 specific_deployment=kwargs.pop("specific_deployment", None),
             )
-
+            kwargs.setdefault("metadata", {}).update(
+                {"deployment": deployment["litellm_params"]["model"]}
+            )
+            kwargs["model_info"] = deployment.get("model_info", {})
             data = deployment["litellm_params"].copy()
+            model_name = data["model"]
             for k, v in self.default_litellm_params.items():
                 if (
                     k not in kwargs
@@ -552,27 +600,38 @@ class Router:
                 elif k == "metadata":
                     kwargs[k].update(v)
 
-            ########## remove -ModelID-XXXX from model ##############
-            original_model_string = data["model"]
-            # Find the index of "ModelID" in the string
-            index_of_model_id = original_model_string.find("-ModelID")
-            # Remove everything after "-ModelID" if it exists
-            if index_of_model_id != -1:
-                data["model"] = original_model_string[:index_of_model_id]
+            potential_model_client = self._get_client(
+                deployment=deployment, kwargs=kwargs, client_type="async"
+            )
+            # check if provided keys == client keys #
+            dynamic_api_key = kwargs.get("api_key", None)
+            if (
+                dynamic_api_key is not None
+                and potential_model_client is not None
+                and dynamic_api_key != potential_model_client.api_key
+            ):
+                model_client = None
             else:
-                data["model"] = original_model_string
-            # call via litellm.atext_completion()
-            response = await litellm.atext_completion(**{**data, "prompt": prompt, "caching": self.cache_responses, **kwargs})  # type: ignore
+                model_client = potential_model_client
+            self.total_calls[model_name] += 1
+            response = await asyncio.wait_for(
+                litellm.atext_completion(
+                    **{
+                        **data,
+                        "prompt": prompt,
+                        "caching": self.cache_responses,
+                        "client": model_client,
+                        **kwargs,
+                    }
+                ),
+                timeout=self.timeout,
+            )
+            self.success_calls[model_name] += 1
             return response
         except Exception as e:
-            if self.num_retries > 0:
-                kwargs["model"] = model
-                kwargs["messages"] = messages
-                kwargs["original_exception"] = e
-                kwargs["original_function"] = self.completion
-                return self.function_with_retries(**kwargs)
-            else:
-                raise e
+            if model_name is not None:
+                self.fail_calls[model_name] += 1
+            raise e
 
     def embedding(
         self,
@@ -776,7 +835,9 @@ class Router:
             #### check if it should retry + back-off if required
             if "No models available" in str(e):
                 timeout = litellm._calculate_retry_after(
-                    remaining_retries=num_retries, max_retries=num_retries
+                    remaining_retries=num_retries,
+                    max_retries=num_retries,
+                    min_timeout=self.retry_after,
                 )
                 await asyncio.sleep(timeout)
             elif (
@@ -789,10 +850,13 @@ class Router:
                         remaining_retries=num_retries,
                         max_retries=num_retries,
                         response_headers=original_exception.response.headers,
+                        min_timeout=self.retry_after,
                     )
                 else:
                     timeout = litellm._calculate_retry_after(
-                        remaining_retries=num_retries, max_retries=num_retries
+                        remaining_retries=num_retries,
+                        max_retries=num_retries,
+                        min_timeout=self.retry_after,
                     )
                 await asyncio.sleep(timeout)
             else:
@@ -823,7 +887,7 @@ class Router:
                         timeout = litellm._calculate_retry_after(
                             remaining_retries=remaining_retries,
                             max_retries=num_retries,
-                            min_timeout=1,
+                            min_timeout=self.retry_after,
                         )
                         await asyncio.sleep(timeout)
                     elif (
@@ -836,11 +900,13 @@ class Router:
                                 remaining_retries=remaining_retries,
                                 max_retries=num_retries,
                                 response_headers=e.response.headers,
+                                min_timeout=self.retry_after,
                             )
                         else:
                             timeout = litellm._calculate_retry_after(
                                 remaining_retries=remaining_retries,
                                 max_retries=num_retries,
+                                min_timeout=self.retry_after,
                             )
                         await asyncio.sleep(timeout)
                     else:
@@ -972,7 +1038,7 @@ class Router:
                         timeout = litellm._calculate_retry_after(
                             remaining_retries=remaining_retries,
                             max_retries=num_retries,
-                            min_timeout=1,
+                            min_timeout=self.retry_after,
                         )
                         time.sleep(timeout)
                     elif (
@@ -985,11 +1051,13 @@ class Router:
                                 remaining_retries=remaining_retries,
                                 max_retries=num_retries,
                                 response_headers=e.response.headers,
+                                min_timeout=self.retry_after,
                             )
                         else:
                             timeout = litellm._calculate_retry_after(
                                 remaining_retries=remaining_retries,
                                 max_retries=num_retries,
+                                min_timeout=self.retry_after,
                             )
                         time.sleep(timeout)
                     else:
@@ -997,40 +1065,6 @@ class Router:
             raise original_exception
 
     ### HELPER FUNCTIONS
-
-    def deployment_callback(
-        self,
-        kwargs,  # kwargs to completion
-        completion_response,  # response from completion
-        start_time,
-        end_time,  # start/end time
-    ):
-        """
-        Function LiteLLM submits a callback to after a successful
-        completion. Purpose of this is to update TPM/RPM usage per model
-        """
-        deployment_id = (
-            kwargs.get("litellm_params", {}).get("model_info", {}).get("id", None)
-        )
-        model_name = kwargs.get("model", None)  # i.e. gpt35turbo
-        custom_llm_provider = kwargs.get("litellm_params", {}).get(
-            "custom_llm_provider", None
-        )  # i.e. azure
-        if custom_llm_provider:
-            model_name = f"{custom_llm_provider}/{model_name}"
-        if kwargs["stream"] is True:
-            if kwargs.get("complete_streaming_response"):
-                total_tokens = kwargs.get("complete_streaming_response")["usage"][
-                    "total_tokens"
-                ]
-                self._set_deployment_usage(deployment_id, total_tokens)
-        else:
-            total_tokens = completion_response["usage"]["total_tokens"]
-            self._set_deployment_usage(deployment_id, total_tokens)
-
-        self.deployment_latency_map[model_name] = (
-            end_time - start_time
-        ).total_seconds()
 
     def deployment_callback_on_failure(
         self,
@@ -1166,109 +1200,6 @@ class Router:
         self.print_verbose(f"retrieve cooldown models: {cooldown_models}")
         return cooldown_models
 
-    def get_usage_based_available_deployment(
-        self,
-        model: str,
-        messages: Optional[List[Dict[str, str]]] = None,
-        input: Optional[Union[str, List]] = None,
-    ):
-        """
-        Returns a deployment with the lowest TPM/RPM usage.
-        """
-        # get list of potential deployments
-        potential_deployments = []
-        for item in self.model_list:
-            if item["model_name"] == model:
-                potential_deployments.append(item)
-
-        # get current call usage
-        token_count = 0
-        if messages is not None:
-            token_count = litellm.token_counter(model=model, messages=messages)
-        elif input is not None:
-            if isinstance(input, List):
-                input_text = "".join(text for text in input)
-            else:
-                input_text = input
-            token_count = litellm.token_counter(model=model, text=input_text)
-
-        # -----------------------
-        # Find lowest used model
-        # ----------------------
-        lowest_tpm = float("inf")
-        deployment = None
-
-        # load model context map
-        models_context_map = litellm.model_cost
-
-        # return deployment with lowest tpm usage
-        for item in potential_deployments:
-            model_id = item["model_info"].get("id")
-            item_tpm, item_rpm = self._get_deployment_usage(deployment_name=model_id)
-
-            if item_tpm == 0:
-                return item
-            elif (
-                "tpm" in item
-                and item_tpm + token_count > item["tpm"]
-                or "rpm" in item
-                and item_rpm + 1 >= item["rpm"]
-            ):  # if user passed in tpm / rpm in the model_list
-                continue
-            elif item_tpm < lowest_tpm:
-                lowest_tpm = item_tpm
-                deployment = item
-
-        # if none, raise exception
-        if deployment is None:
-            raise ValueError("No models available.")
-
-        # return model
-        return deployment
-
-    def _get_deployment_usage(self, deployment_name: str):
-        # ------------
-        # Setup values
-        # ------------
-        current_minute = datetime.now().strftime("%H-%M")
-        tpm_key = f"{deployment_name}:tpm:{current_minute}"
-        rpm_key = f"{deployment_name}:rpm:{current_minute}"
-
-        # ------------
-        # Return usage
-        # ------------
-        tpm = self.cache.get_cache(key=tpm_key) or 0
-        rpm = self.cache.get_cache(key=rpm_key) or 0
-
-        return int(tpm), int(rpm)
-
-    def increment(self, key: str, increment_value: int):
-        # get value
-        cached_value = self.cache.get_cache(key=key)
-        # update value
-        try:
-            cached_value = cached_value + increment_value
-        except:
-            cached_value = increment_value
-        # save updated value
-        self.cache.set_cache(
-            value=cached_value, key=key, ttl=self.default_cache_time_seconds
-        )
-
-    def _set_deployment_usage(self, model_name: str, total_tokens: int):
-        # ------------
-        # Setup values
-        # ------------
-        current_minute = datetime.now().strftime("%H-%M")
-        tpm_key = f"{model_name}:tpm:{current_minute}"
-        rpm_key = f"{model_name}:rpm:{current_minute}"
-
-        # ------------
-        # Update usage
-        # ------------
-        self.increment(tpm_key, total_tokens)
-        self.increment(rpm_key, 1)
-
     def _start_health_check_thread(self):
         """
         Starts a separate thread to perform health checks periodically.
@@ -1328,208 +1259,297 @@ class Router:
             chosen_item = random.choices(sorted_items, weights=weights, k=1)[0][0]
         return chosen_item
 
+    def set_client(self, model: dict):
+        """
+        Initializes Azure/OpenAI clients. Stores them in cache, b/c of this - https://github.com/BerriAI/litellm/issues/1278
+        """
+        client_ttl = self.client_ttl
+        litellm_params = model.get("litellm_params", {})
+        model_name = litellm_params.get("model")
+        model_id = model["model_info"]["id"]
+        ####  for OpenAI / Azure we need to initalize the Client for High Traffic ########
+        custom_llm_provider = litellm_params.get("custom_llm_provider")
+        custom_llm_provider = custom_llm_provider or model_name.split("/", 1)[0] or ""
+        default_api_base = None
+        default_api_key = None
+        if custom_llm_provider in litellm.openai_compatible_providers:
+            _, custom_llm_provider, api_key, api_base = litellm.get_llm_provider(
+                model=model_name
+            )
+            default_api_base = api_base
+            default_api_key = api_key
+        if (
+            model_name in litellm.open_ai_chat_completion_models
+            or custom_llm_provider in litellm.openai_compatible_providers
+            or custom_llm_provider == "azure"
+            or custom_llm_provider == "custom_openai"
+            or custom_llm_provider == "openai"
+            or "ft:gpt-3.5-turbo" in model_name
+            or model_name in litellm.open_ai_embedding_models
+        ):
+            # glorified / complicated reading of configs
+            # user can pass vars directly or they can pas os.environ/AZURE_API_KEY, in which case we will read the env
+            # we do this here because we init clients for Azure, OpenAI and we need to set the right key
+            api_key = litellm_params.get("api_key") or default_api_key
+            if api_key and api_key.startswith("os.environ/"):
+                api_key_env_name = api_key.replace("os.environ/", "")
+                api_key = litellm.get_secret(api_key_env_name)
+                litellm_params["api_key"] = api_key
+
+            api_base = litellm_params.get("api_base")
+            base_url = litellm_params.get("base_url")
+            api_base = (
+                api_base or base_url or default_api_base
+            )  # allow users to pass in `api_base` or `base_url` for azure
+            if api_base and api_base.startswith("os.environ/"):
+                api_base_env_name = api_base.replace("os.environ/", "")
+                api_base = litellm.get_secret(api_base_env_name)
+                litellm_params["api_base"] = api_base
+
+            api_version = litellm_params.get("api_version")
+            if api_version and api_version.startswith("os.environ/"):
+                api_version_env_name = api_version.replace("os.environ/", "")
+                api_version = litellm.get_secret(api_version_env_name)
+                litellm_params["api_version"] = api_version
+
+            timeout = litellm_params.pop("timeout", None)
+            if isinstance(timeout, str) and timeout.startswith("os.environ/"):
+                timeout_env_name = timeout.replace("os.environ/", "")
+                timeout = litellm.get_secret(timeout_env_name)
+                litellm_params["timeout"] = timeout
+
+            stream_timeout = litellm_params.pop(
+                "stream_timeout", timeout
+            )  # if no stream_timeout is set, default to timeout
+            if isinstance(stream_timeout, str) and stream_timeout.startswith(
+                "os.environ/"
+            ):
+                stream_timeout_env_name = stream_timeout.replace("os.environ/", "")
+                stream_timeout = litellm.get_secret(stream_timeout_env_name)
+                litellm_params["stream_timeout"] = stream_timeout
+
+            max_retries = litellm_params.pop("max_retries", 2)
+            if isinstance(max_retries, str) and max_retries.startswith("os.environ/"):
+                max_retries_env_name = max_retries.replace("os.environ/", "")
+                max_retries = litellm.get_secret(max_retries_env_name)
+                litellm_params["max_retries"] = max_retries
+
+            if "azure" in model_name:
+                if api_base is None:
+                    raise ValueError(
+                        f"api_base is required for Azure OpenAI. Set it on your config. Model - {model}"
+                    )
+                if api_version is None:
+                    api_version = "2023-07-01-preview"
+                if "gateway.ai.cloudflare.com" in api_base:
+                    if not api_base.endswith("/"):
+                        api_base += "/"
+                    azure_model = model_name.replace("azure/", "")
+                    api_base += f"{azure_model}"
+                    cache_key = f"{model_id}_async_client"
+                    _client = openai.AsyncAzureOpenAI(
+                        api_key=api_key,
+                        base_url=api_base,
+                        api_version=api_version,
+                        timeout=timeout,
+                        max_retries=max_retries,
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+
+                    _client = openai.AzureOpenAI(  # type: ignore
+                        api_key=api_key,
+                        base_url=api_base,
+                        api_version=api_version,
+                        timeout=timeout,
+                        max_retries=max_retries,
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+                    # streaming clients can have diff timeouts
+                    cache_key = f"{model_id}_stream_async_client"
+                    _client = openai.AsyncAzureOpenAI(  # type: ignore
+                        api_key=api_key,
+                        base_url=api_base,
+                        api_version=api_version,
+                        timeout=stream_timeout,
+                        max_retries=max_retries,
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+
+                    cache_key = f"{model_id}_stream_client"
+                    _client = openai.AzureOpenAI(  # type: ignore
+                        api_key=api_key,
+                        base_url=api_base,
+                        api_version=api_version,
+                        timeout=stream_timeout,
+                        max_retries=max_retries,
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+                else:
+                    self.print_verbose(
+                        f"Initializing Azure OpenAI Client for {model_name}, Api Base: {str(api_base)}, Api Key:{api_key}"
+                    )
+
+                    cache_key = f"{model_id}_async_client"
+                    _client = openai.AsyncAzureOpenAI(  # type: ignore
+                        api_key=api_key,
+                        azure_endpoint=api_base,
+                        api_version=api_version,
+                        timeout=timeout,
+                        max_retries=max_retries,
+                        http_client=httpx.AsyncClient(
+                            transport=AsyncCustomHTTPTransport(),
+                        ),  # type: ignore
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+
+                    cache_key = f"{model_id}_client"
+                    _client = openai.AzureOpenAI(  # type: ignore
+                        api_key=api_key,
+                        azure_endpoint=api_base,
+                        api_version=api_version,
+                        timeout=timeout,
+                        max_retries=max_retries,
+                        http_client=httpx.Client(
+                            transport=CustomHTTPTransport(),
+                        ),  # type: ignore
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+
+                    # streaming clients should have diff timeouts
+                    cache_key = f"{model_id}_stream_async_client"
+                    _client = openai.AsyncAzureOpenAI(  # type: ignore
+                        api_key=api_key,
+                        azure_endpoint=api_base,
+                        api_version=api_version,
+                        timeout=stream_timeout,
+                        max_retries=max_retries,
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+
+                    cache_key = f"{model_id}_stream_client"
+                    _client = openai.AzureOpenAI(  # type: ignore
+                        api_key=api_key,
+                        azure_endpoint=api_base,
+                        api_version=api_version,
+                        timeout=stream_timeout,
+                        max_retries=max_retries,
+                    )
+                    self.cache.set_cache(
+                        key=cache_key,
+                        value=_client,
+                        ttl=client_ttl,
+                        local_only=True,
+                    )  # cache for 1 hr
+
+            else:
+                self.print_verbose(
+                    f"Initializing OpenAI Client for {model_name}, Api Base:{str(api_base)}, Api Key:{api_key}"
+                )
+                cache_key = f"{model_id}_async_client"
+                _client = openai.AsyncOpenAI(  # type: ignore
+                    api_key=api_key,
+                    base_url=api_base,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                )
+                self.cache.set_cache(
+                    key=cache_key,
+                    value=_client,
+                    ttl=client_ttl,
+                    local_only=True,
+                )  # cache for 1 hr
+
+                cache_key = f"{model_id}_client"
+                _client = openai.OpenAI(  # type: ignore
+                    api_key=api_key,
+                    base_url=api_base,
+                    timeout=timeout,
+                    max_retries=max_retries,
+                )
+                self.cache.set_cache(
+                    key=cache_key,
+                    value=_client,
+                    ttl=client_ttl,
+                    local_only=True,
+                )  # cache for 1 hr
+
+                # streaming clients should have diff timeouts
+                cache_key = f"{model_id}_stream_async_client"
+                _client = openai.AsyncOpenAI(  # type: ignore
+                    api_key=api_key,
+                    base_url=api_base,
+                    timeout=stream_timeout,
+                    max_retries=max_retries,
+                )
+                self.cache.set_cache(
+                    key=cache_key,
+                    value=_client,
+                    ttl=client_ttl,
+                    local_only=True,
+                )  # cache for 1 hr
+
+                # streaming clients should have diff timeouts
+                cache_key = f"{model_id}_stream_client"
+                _client = openai.OpenAI(  # type: ignore
+                    api_key=api_key,
+                    base_url=api_base,
+                    timeout=stream_timeout,
+                    max_retries=max_retries,
+                )
+                self.cache.set_cache(
+                    key=cache_key,
+                    value=_client,
+                    ttl=client_ttl,
+                    local_only=True,
+                )  # cache for 1 hr
+
     def set_model_list(self, model_list: list):
         self.model_list = copy.deepcopy(model_list)
         # we add api_base/api_key each model so load balancing between azure/gpt on api_base1 and api_base2 works
         import os
 
         for model in self.model_list:
-            litellm_params = model.get("litellm_params", {})
-            model_name = litellm_params.get("model")
             #### MODEL ID INIT ########
             model_info = model.get("model_info", {})
             model_info["id"] = model_info.get("id", str(uuid.uuid4()))
             model["model_info"] = model_info
-            ####  for OpenAI / Azure we need to initalize the Client for High Traffic ########
-            custom_llm_provider = litellm_params.get("custom_llm_provider")
-            custom_llm_provider = (
-                custom_llm_provider or model_name.split("/", 1)[0] or ""
-            )
-            default_api_base = None
-            default_api_key = None
-            if custom_llm_provider in litellm.openai_compatible_providers:
-                _, custom_llm_provider, api_key, api_base = litellm.get_llm_provider(
-                    model=model_name
-                )
-                default_api_base = api_base
-                default_api_key = api_key
-            if (
-                model_name in litellm.open_ai_chat_completion_models
-                or custom_llm_provider in litellm.openai_compatible_providers
-                or custom_llm_provider == "azure"
-                or custom_llm_provider == "custom_openai"
-                or custom_llm_provider == "openai"
-                or "ft:gpt-3.5-turbo" in model_name
-                or model_name in litellm.open_ai_embedding_models
-            ):
-                # glorified / complicated reading of configs
-                # user can pass vars directly or they can pas os.environ/AZURE_API_KEY, in which case we will read the env
-                # we do this here because we init clients for Azure, OpenAI and we need to set the right key
-                api_key = litellm_params.get("api_key") or default_api_key
-                if api_key and api_key.startswith("os.environ/"):
-                    api_key_env_name = api_key.replace("os.environ/", "")
-                    api_key = litellm.get_secret(api_key_env_name)
-                    litellm_params["api_key"] = api_key
-
-                api_base = litellm_params.get("api_base")
-                base_url = litellm_params.get("base_url")
-                api_base = (
-                    api_base or base_url or default_api_base
-                )  # allow users to pass in `api_base` or `base_url` for azure
-                if api_base and api_base.startswith("os.environ/"):
-                    api_base_env_name = api_base.replace("os.environ/", "")
-                    api_base = litellm.get_secret(api_base_env_name)
-                    litellm_params["api_base"] = api_base
-
-                api_version = litellm_params.get("api_version")
-                if api_version and api_version.startswith("os.environ/"):
-                    api_version_env_name = api_version.replace("os.environ/", "")
-                    api_version = litellm.get_secret(api_version_env_name)
-                    litellm_params["api_version"] = api_version
-
-                timeout = litellm_params.pop("timeout", None)
-                if isinstance(timeout, str) and timeout.startswith("os.environ/"):
-                    timeout_env_name = timeout.replace("os.environ/", "")
-                    timeout = litellm.get_secret(timeout_env_name)
-                    litellm_params["timeout"] = timeout
-
-                stream_timeout = litellm_params.pop(
-                    "stream_timeout", timeout
-                )  # if no stream_timeout is set, default to timeout
-                if isinstance(stream_timeout, str) and stream_timeout.startswith(
-                    "os.environ/"
-                ):
-                    stream_timeout_env_name = stream_timeout.replace("os.environ/", "")
-                    stream_timeout = litellm.get_secret(stream_timeout_env_name)
-                    litellm_params["stream_timeout"] = stream_timeout
-
-                max_retries = litellm_params.pop("max_retries", 2)
-                if isinstance(max_retries, str) and max_retries.startswith(
-                    "os.environ/"
-                ):
-                    max_retries_env_name = max_retries.replace("os.environ/", "")
-                    max_retries = litellm.get_secret(max_retries_env_name)
-                    litellm_params["max_retries"] = max_retries
-
-                if "azure" in model_name:
-                    if api_base is None:
-                        raise ValueError(
-                            f"api_base is required for Azure OpenAI. Set it on your config. Model - {model}"
-                        )
-                    if api_version is None:
-                        api_version = "2023-07-01-preview"
-                    if "gateway.ai.cloudflare.com" in api_base:
-                        if not api_base.endswith("/"):
-                            api_base += "/"
-                        azure_model = model_name.replace("azure/", "")
-                        api_base += f"{azure_model}"
-                        model["async_client"] = openai.AsyncAzureOpenAI(
-                            api_key=api_key,
-                            base_url=api_base,
-                            api_version=api_version,
-                            timeout=timeout,
-                            max_retries=max_retries,
-                        )
-                        model["client"] = openai.AzureOpenAI(
-                            api_key=api_key,
-                            base_url=api_base,
-                            api_version=api_version,
-                            timeout=timeout,
-                            max_retries=max_retries,
-                        )
-
-                        # streaming clients can have diff timeouts
-                        model["stream_async_client"] = openai.AsyncAzureOpenAI(
-                            api_key=api_key,
-                            base_url=api_base,
-                            api_version=api_version,
-                            timeout=stream_timeout,
-                            max_retries=max_retries,
-                        )
-                        model["stream_client"] = openai.AzureOpenAI(
-                            api_key=api_key,
-                            base_url=api_base,
-                            api_version=api_version,
-                            timeout=stream_timeout,
-                            max_retries=max_retries,
-                        )
-                    else:
-                        self.print_verbose(
-                            f"Initializing Azure OpenAI Client for {model_name}, Api Base: {str(api_base)}, Api Key:{api_key}"
-                        )
-                        model["async_client"] = openai.AsyncAzureOpenAI(
-                            api_key=api_key,
-                            azure_endpoint=api_base,
-                            api_version=api_version,
-                            timeout=timeout,
-                            max_retries=max_retries,
-                            http_client=httpx.AsyncClient(
-                                transport=AsyncCustomHTTPTransport(),
-                            ),  # type: ignore
-                        )
-                        model["client"] = openai.AzureOpenAI(
-                            api_key=api_key,
-                            azure_endpoint=api_base,
-                            api_version=api_version,
-                            timeout=timeout,
-                            max_retries=max_retries,
-                            http_client=httpx.Client(
-                                transport=CustomHTTPTransport(),
-                            ),  # type: ignore
-                        )
-                        # streaming clients should have diff timeouts
-                        model["stream_async_client"] = openai.AsyncAzureOpenAI(
-                            api_key=api_key,
-                            azure_endpoint=api_base,
-                            api_version=api_version,
-                            timeout=stream_timeout,
-                            max_retries=max_retries,
-                        )
-
-                        model["stream_client"] = openai.AzureOpenAI(
-                            api_key=api_key,
-                            azure_endpoint=api_base,
-                            api_version=api_version,
-                            timeout=stream_timeout,
-                            max_retries=max_retries,
-                        )
-
-                else:
-                    self.print_verbose(
-                        f"Initializing OpenAI Client for {model_name}, Api Base:{str(api_base)}, Api Key:{api_key}"
-                    )
-                    model["async_client"] = openai.AsyncOpenAI(
-                        api_key=api_key,
-                        base_url=api_base,
-                        timeout=timeout,
-                        max_retries=max_retries,
-                    )
-                    model["client"] = openai.OpenAI(
-                        api_key=api_key,
-                        base_url=api_base,
-                        timeout=timeout,
-                        max_retries=max_retries,
-                    )
-
-                    # streaming clients should have diff timeouts
-                    model["stream_async_client"] = openai.AsyncOpenAI(
-                        api_key=api_key,
-                        base_url=api_base,
-                        timeout=stream_timeout,
-                        max_retries=max_retries,
-                    )
-
-                    # streaming clients should have diff timeouts
-                    model["stream_client"] = openai.OpenAI(
-                        api_key=api_key,
-                        base_url=api_base,
-                        timeout=stream_timeout,
-                        max_retries=max_retries,
-                    )
-
-            ############ End of initializing Clients for OpenAI/Azure ###################
+            #### DEPLOYMENT NAMES INIT ########
             self.deployment_names.append(model["litellm_params"]["model"])
-
             ############ Users can either pass tpm/rpm as a litellm_param or a router param ###########
             # for get_available_deployment, we use the litellm_param["rpm"]
             # in this snippet we also set rpm to be a litellm_param
@@ -1543,6 +1563,8 @@ class Router:
                 and model.get("tpm") is not None
             ):
                 model["litellm_params"]["tpm"] = model.get("tpm")
+
+            self.set_client(model=model)
 
         self.print_verbose(f"\nInitialized Model List {self.model_list}")
         self.model_names = [m["model_name"] for m in model_list]
@@ -1562,16 +1584,49 @@ class Router:
         Returns:
             The appropriate client based on the given client_type and kwargs.
         """
+        model_id = deployment["model_info"]["id"]
         if client_type == "async":
             if kwargs.get("stream") == True:
-                return deployment.get("stream_async_client", None)
+                cache_key = f"{model_id}_stream_async_client"
+                client = self.cache.get_cache(key=cache_key, local_only=True)
+                if client is None:
+                    """
+                    Re-initialize the client
+                    """
+                    self.set_client(model=deployment)
+                    client = self.cache.get_cache(key=cache_key, local_only=True)
+                return client
             else:
-                return deployment.get("async_client", None)
+                cache_key = f"{model_id}_async_client"
+                client = self.cache.get_cache(key=cache_key, local_only=True)
+                if client is None:
+                    """
+                    Re-initialize the client
+                    """
+                    self.set_client(model=deployment)
+                    client = self.cache.get_cache(key=cache_key, local_only=True)
+                return client
         else:
             if kwargs.get("stream") == True:
-                return deployment.get("stream_client", None)
+                cache_key = f"{model_id}_stream_client"
+                client = self.cache.get_cache(key=cache_key)
+                if client is None:
+                    """
+                    Re-initialize the client
+                    """
+                    self.set_client(model=deployment)
+                    client = self.cache.get_cache(key=cache_key)
+                return client
             else:
-                return deployment.get("client", None)
+                cache_key = f"{model_id}_client"
+                client = self.cache.get_cache(key=cache_key)
+                if client is None:
+                    """
+                    Re-initialize the client
+                    """
+                    self.set_client(model=deployment)
+                    client = self.cache.get_cache(key=cache_key)
+                return client
 
     def print_verbose(self, print_statement):
         try:
@@ -1647,26 +1702,10 @@ class Router:
                 model
             ]  # update the model to the actual value if an alias has been passed in
         if self.routing_strategy == "least-busy" and self.leastbusy_logger is not None:
-            deployments = self.leastbusy_logger.get_available_deployments(
-                model_group=model
+            deployment = self.leastbusy_logger.get_available_deployments(
+                model_group=model, healthy_deployments=healthy_deployments
             )
-            # pick least busy deployment
-            min_traffic = float("inf")
-            min_deployment = None
-            for k, v in deployments.items():
-                if v < min_traffic:
-                    min_traffic = v
-                    min_deployment = k
-            ############## No Available Deployments passed, we do a random pick #################
-            if min_deployment is None:
-                min_deployment = random.choice(healthy_deployments)
-            ############## Available Deployments passed, we find the relevant item #################
-            else:
-                for m in healthy_deployments:
-                    if m["model_info"]["id"] == min_deployment:
-                        return m
-                min_deployment = random.choice(healthy_deployments)
-            return min_deployment
+            return deployment
         elif self.routing_strategy == "simple-shuffle":
             # if users pass rpm or tpm, we do a random weighted pick - based on rpm/tpm
             ############## Check if we can do a RPM/TPM based weighted pick #################
@@ -1701,22 +1740,26 @@ class Router:
             ############## No RPM/TPM passed, we do a random pick #################
             item = random.choice(healthy_deployments)
             return item or item[0]
-        elif self.routing_strategy == "latency-based-routing":
-            returned_item = None
-            lowest_latency = float("inf")
-            ### shuffles with priority for lowest latency
-            # items_with_latencies = [('A', 10), ('B', 20), ('C', 30), ('D', 40)]
-            items_with_latencies = []
-            for item in healthy_deployments:
-                items_with_latencies.append(
-                    (item, self.deployment_latency_map[item["litellm_params"]["model"]])
-                )
-            returned_item = self.weighted_shuffle_by_latency(items_with_latencies)
-            return returned_item
-        elif self.routing_strategy == "usage-based-routing":
-            return self.get_usage_based_available_deployment(
-                model=model, messages=messages, input=input
+        elif (
+            self.routing_strategy == "latency-based-routing"
+            and self.lowestlatency_logger is not None
+        ):
+            min_deployment = self.lowestlatency_logger.get_available_deployments(
+                model_group=model, healthy_deployments=healthy_deployments
             )
+            if min_deployment is None:
+                min_deployment = random.choice(healthy_deployments)
+            return min_deployment
+        elif (
+            self.routing_strategy == "usage-based-routing"
+            and self.lowesttpm_logger is not None
+        ):
+            min_deployment = self.lowesttpm_logger.get_available_deployments(
+                model_group=model, healthy_deployments=healthy_deployments
+            )
+            if min_deployment is None:
+                min_deployment = random.choice(healthy_deployments)
+            return min_deployment
 
         raise ValueError("No models available.")
 

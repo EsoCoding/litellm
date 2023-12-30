@@ -14,6 +14,7 @@ import litellm
 from litellm import embedding, completion
 from litellm.caching import Cache
 import random
+import hashlib
 
 # litellm.set_verbose=True
 
@@ -656,12 +657,13 @@ def test_get_cache_key():
                 "litellm_logging_obj": {},
             }
         )
+        cache_key_str = "model: gpt-3.5-turbomessages: [{'role': 'user', 'content': 'write a one sentence poem about: 7510'}]temperature: 0.2max_tokens: 40"
+        hash_object = hashlib.sha256(cache_key_str.encode())
+        # Hexadecimal representation of the hash
+        hash_hex = hash_object.hexdigest()
+        assert cache_key == hash_hex
         assert (
-            cache_key
-            == "model: gpt-3.5-turbomessages: [{'role': 'user', 'content': 'write a one sentence poem about: 7510'}]temperature: 0.2max_tokens: 40"
-        )
-        assert (
-            cache_key == cache_key_2
+            cache_key_2 == hash_hex
         ), f"{cache_key} != {cache_key_2}. The same kwargs should have the same cache key across runs"
 
         embedding_cache_key = cache_instance.get_cache_key(
@@ -680,9 +682,14 @@ def test_get_cache_key():
 
         print(embedding_cache_key)
 
+        embedding_cache_key_str = (
+            "model: azure/azure-embedding-modelinput: ['hi who is ishaan']"
+        )
+        hash_object = hashlib.sha256(embedding_cache_key_str.encode())
+        # Hexadecimal representation of the hash
+        hash_hex = hash_object.hexdigest()
         assert (
-            embedding_cache_key
-            == "model: azure/azure-embedding-modelinput: ['hi who is ishaan']"
+            embedding_cache_key == hash_hex
         ), f"{embedding_cache_key} != 'model: azure/azure-embedding-modelinput: ['hi who is ishaan']'. The same kwargs should have the same cache key across runs"
 
         # Proxy - embedding cache, test if embedding key, gets model_group and not model
@@ -736,10 +743,13 @@ def test_get_cache_key():
         )
 
         print(embedding_cache_key_2)
-        assert (
-            embedding_cache_key_2
-            == "model: EMBEDDING_MODEL_GROUPinput: ['hi who is ishaan']"
+        embedding_cache_key_str_2 = (
+            "model: EMBEDDING_MODEL_GROUPinput: ['hi who is ishaan']"
         )
+        hash_object = hashlib.sha256(embedding_cache_key_str_2.encode())
+        # Hexadecimal representation of the hash
+        hash_hex = hash_object.hexdigest()
+        assert embedding_cache_key_2 == hash_hex
         print("passed!")
     except Exception as e:
         traceback.print_exc()
@@ -747,6 +757,37 @@ def test_get_cache_key():
 
 
 # test_get_cache_key()
+
+
+def test_cache_context_managers():
+    litellm.set_verbose = True
+    litellm.cache = Cache(type="redis")
+
+    # cache is on, disable it
+    litellm.disable_cache()
+    assert litellm.cache == None
+    assert "cache" not in litellm.success_callback
+    assert "cache" not in litellm._async_success_callback
+
+    # disable a cache that is off
+    litellm.disable_cache()
+    assert litellm.cache == None
+    assert "cache" not in litellm.success_callback
+    assert "cache" not in litellm._async_success_callback
+
+    litellm.enable_cache(
+        type="redis",
+        host=os.environ["REDIS_HOST"],
+        port=os.environ["REDIS_PORT"],
+    )
+
+    assert litellm.cache != None
+    assert litellm.cache.type == "redis"
+
+    print("VARS of litellm.cache", vars(litellm.cache))
+
+
+# test_cache_context_managers()
 
 # test_custom_redis_cache_params()
 

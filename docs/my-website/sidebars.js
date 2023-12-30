@@ -75,6 +75,7 @@ const sidebars = {
         "providers/anyscale",
         "providers/perplexity", 
         "providers/vllm", 
+        "providers/cloudflare_workers", 
         "providers/deepinfra",
         "providers/ai21", 
         "providers/nlp_cloud",
@@ -123,6 +124,7 @@ const sidebars = {
     "budget_manager",
     "secret",
     "completion/token_usage",
+    "load_test",
     {
       type: 'category',
       label: 'Tutorials',

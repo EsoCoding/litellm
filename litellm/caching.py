@@ -9,7 +9,7 @@
 
 import litellm
 import time, logging
-import json, traceback, ast
+import json, traceback, ast, hashlib
 from typing import Optional, Literal, List
 
 
@@ -133,30 +133,31 @@ class DualCache(BaseCache):
         # If redis_cache is not provided, use the default RedisCache
         self.redis_cache = redis_cache
 
-    def set_cache(self, key, value, **kwargs):
+    def set_cache(self, key, value, local_only: bool = False, **kwargs):
         # Update both Redis and in-memory cache
         try:
             print_verbose(f"set cache: key: {key}; value: {value}")
             if self.in_memory_cache is not None:
                 self.in_memory_cache.set_cache(key, value, **kwargs)
 
-            if self.redis_cache is not None:
+            if self.redis_cache is not None and local_only == False:
                 self.redis_cache.set_cache(key, value, **kwargs)
         except Exception as e:
             print_verbose(e)
 
-    def get_cache(self, key, **kwargs):
+    def get_cache(self, key, local_only: bool = False, **kwargs):
         # Try to fetch from in-memory cache first
         try:
-            print_verbose(f"get cache: cache key: {key}")
+            print_verbose(f"get cache: cache key: {key}; local_only: {local_only}")
             result = None
             if self.in_memory_cache is not None:
                 in_memory_result = self.in_memory_cache.get_cache(key, **kwargs)
 
+                print_verbose(f"in_memory_result: {in_memory_result}")
                 if in_memory_result is not None:
                     result = in_memory_result
 
-            if self.redis_cache is not None:
+            if result is None and self.redis_cache is not None and local_only == False:
                 # If not found in in-memory cache, try fetching from Redis
                 redis_result = self.redis_cache.get_cache(key, **kwargs)
 
@@ -219,6 +220,7 @@ class Cache:
         if "cache" not in litellm._async_success_callback:
             litellm._async_success_callback.append("cache")
         self.supported_call_types = supported_call_types  # default to ["completion", "acompletion", "embedding", "aembedding"]
+        self.type = type
 
     def get_cache_key(self, *args, **kwargs):
         """
@@ -301,7 +303,12 @@ class Cache:
                     param_value = kwargs[param]
                 cache_key += f"{str(param)}: {str(param_value)}"
         print_verbose(f"\nCreated cache key: {cache_key}")
-        return cache_key
+        # Use hashlib to create a sha256 hash of the cache key
+        hash_object = hashlib.sha256(cache_key.encode())
+        # Hexadecimal representation of the hash
+        hash_hex = hash_object.hexdigest()
+        print_verbose(f"Hashed cache key (SHA-256): {hash_hex}")
+        return hash_hex
 
     def generate_streaming_content(self, content):
         chunk_size = 5  # Adjust the chunk size as needed
@@ -368,3 +375,115 @@ class Cache:
 
     async def _async_add_cache(self, result, *args, **kwargs):
         self.add_cache(result, *args, **kwargs)
+
+
+def enable_cache(
+    type: Optional[Literal["local", "redis"]] = "local",
+    host: Optional[str] = None,
+    port: Optional[str] = None,
+    password: Optional[str] = None,
+    supported_call_types: Optional[
+        List[Literal["completion", "acompletion", "embedding", "aembedding"]]
+    ] = ["completion", "acompletion", "embedding", "aembedding"],
+    **kwargs,
+):
+    """
+    Enable cache with the specified configuration.
+
+    Args:
+        type (Optional[Literal["local", "redis"]]): The type of cache to enable. Defaults to "local".
+        host (Optional[str]): The host address of the cache server. Defaults to None.
+        port (Optional[str]): The port number of the cache server. Defaults to None.
+        password (Optional[str]): The password for the cache server. Defaults to None.
+        supported_call_types (Optional[List[Literal["completion", "acompletion", "embedding", "aembedding"]]]):
+            The supported call types for the cache. Defaults to ["completion", "acompletion", "embedding", "aembedding"].
+        **kwargs: Additional keyword arguments.
+
+    Returns:
+        None
+
+    Raises:
+        None
+    """
+    print_verbose("LiteLLM: Enabling Cache")
+    if "cache" not in litellm.input_callback:
+        litellm.input_callback.append("cache")
+    if "cache" not in litellm.success_callback:
+        litellm.success_callback.append("cache")
+    if "cache" not in litellm._async_success_callback:
+        litellm._async_success_callback.append("cache")
+
+    if litellm.cache == None:
+        litellm.cache = Cache(
+            type=type,
+            host=host,
+            port=port,
+            password=password,
+            supported_call_types=supported_call_types,
+            **kwargs,
+        )
+    print_verbose(f"LiteLLM: Cache enabled, litellm.cache={litellm.cache}")
+    print_verbose(f"LiteLLM Cache: {vars(litellm.cache)}")
+
+
+def update_cache(
+    type: Optional[Literal["local", "redis"]] = "local",
+    host: Optional[str] = None,
+    port: Optional[str] = None,
+    password: Optional[str] = None,
+    supported_call_types: Optional[
+        List[Literal["completion", "acompletion", "embedding", "aembedding"]]
+    ] = ["completion", "acompletion", "embedding", "aembedding"],
+    **kwargs,
+):
+    """
+    Update the cache for LiteLLM.
+
+    Args:
+        type (Optional[Literal["local", "redis"]]): The type of cache. Defaults to "local".
+        host (Optional[str]): The host of the cache. Defaults to None.
+        port (Optional[str]): The port of the cache. Defaults to None.
+        password (Optional[str]): The password for the cache. Defaults to None.
+        supported_call_types (Optional[List[Literal["completion", "acompletion", "embedding", "aembedding"]]]):
+            The supported call types for the cache. Defaults to ["completion", "acompletion", "embedding", "aembedding"].
+        **kwargs: Additional keyword arguments for the cache.
+
+    Returns:
+        None
+
+    """
+    print_verbose("LiteLLM: Updating Cache")
+    litellm.cache = Cache(
+        type=type,
+        host=host,
+        port=port,
+        password=password,
+        supported_call_types=supported_call_types,
+        **kwargs,
+    )
+    print_verbose(f"LiteLLM: Cache Updated, litellm.cache={litellm.cache}")
+    print_verbose(f"LiteLLM Cache: {vars(litellm.cache)}")
+
+
+def disable_cache():
+    """
+    Disable the cache used by LiteLLM.
+
+    This function disables the cache used by the LiteLLM module. It removes the cache-related callbacks from the input_callback, success_callback, and _async_success_callback lists. It also sets the litellm.cache attribute to None.
+
+    Parameters:
+    None
+
+    Returns:
+    None
+    """
+    from contextlib import suppress
+
+    print_verbose("LiteLLM: Disabling Cache")
+    with suppress(ValueError):
+        litellm.input_callback.remove("cache")
+        litellm.success_callback.remove("cache")
+        litellm._async_success_callback.remove("cache")
+
+    litellm.cache = None
+    print_verbose(f"LiteLLM: Cache disabled, litellm.cache={litellm.cache}")

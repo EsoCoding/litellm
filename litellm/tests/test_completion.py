@@ -1916,7 +1916,7 @@ def test_completion_gemini():
         pytest.fail(f"Error occurred: {e}")
 
 
-test_completion_gemini()
+# test_completion_gemini()
 
 
 # Palm tests
@@ -2002,12 +2002,22 @@ def test_completion_together_ai_stream():
 # test_completion_together_ai_stream()
 
 
-# async def get_response(generator):
-#     async for elem in generator:
-#         print(elem)
-#     return
+# Cloud flare AI tests
+def test_completion_cloudflare():
+    try:
+        litellm.set_verbose = True
+        response = completion(
+            model="cloudflare/@cf/meta/llama-2-7b-chat-int8",
+            messages=[{"content": "what llm are you", "role": "user"}],
+            max_tokens=15,
+        )
+        print(response)
 
-# test_completion_together_ai_stream()
+    except Exception as e:
+        pytest.fail(f"Error occurred: {e}")
+
+
+test_completion_cloudflare()
 
 
 def test_moderation():

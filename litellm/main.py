@@ -50,6 +50,7 @@ from .llms import (
     vllm,
     ollama,
     ollama_chat,
+    cloudflare,
     cohere,
     petals,
     oobabooga,
@@ -70,6 +71,7 @@ from .llms.prompt_templates.factory import (
 import tiktoken
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Dict, Union, Mapping
+from .caching import enable_cache, disable_cache, update_cache
 
 encoding = tiktoken.get_encoding("cl100k_base")
 from litellm.utils import (
@@ -211,15 +213,15 @@ async def acompletion(*args, **kwargs):
         else:
             # Call the synchronous function using run_in_executor
             response = await loop.run_in_executor(None, func_with_context)
-        if kwargs.get("stream", False):  # return an async generator
-            return _async_streaming(
-                response=response,
-                model=model,
-                custom_llm_provider=custom_llm_provider,
-                args=args,
-            )
-        else:
-            return response
+        # if kwargs.get("stream", False):  # return an async generator
+        #     return _async_streaming(
+        #         response=response,
+        #         model=model,
+        #         custom_llm_provider=custom_llm_provider,
+        #         args=args,
+        #     )
+        # else:
+        return response
     except Exception as e:
         custom_llm_provider = custom_llm_provider or "openai"
         raise exception_type(
@@ -546,10 +548,6 @@ def completion(
         model_api_key = get_api_key(
             llm_provider=custom_llm_provider, dynamic_api_key=api_key
         )  # get the api key from the environment if required for the model
-        if model_api_key and "sk-litellm" in model_api_key:
-            api_base = "https://proxy.litellm.ai"
-            custom_llm_provider = "openai"
-            api_key = model_api_key
 
         if dynamic_api_key is not None:
             api_key = dynamic_api_key
@@ -1564,6 +1562,53 @@ def completion(
                 return generator
 
             response = generator
+        elif custom_llm_provider == "cloudflare":
+            api_key = (
+                api_key
+                or litellm.cloudflare_api_key
+                or litellm.api_key
+                or get_secret("CLOUDFLARE_API_KEY")
+            )
+            account_id = get_secret("CLOUDFLARE_ACCOUNT_ID")
+            api_base = (
+                api_base
+                or litellm.api_base
+                or get_secret("CLOUDFLARE_API_BASE")
+                or f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/"
+            )
+
+            custom_prompt_dict = custom_prompt_dict or litellm.custom_prompt_dict
+            response = cloudflare.completion(
+                model=model,
+                messages=messages,
+                api_base=api_base,
+                custom_prompt_dict=litellm.custom_prompt_dict,
+                model_response=model_response,
+                print_verbose=print_verbose,
+                optional_params=optional_params,
+                litellm_params=litellm_params,
+                logger_fn=logger_fn,
+                encoding=encoding,  # for calculating input/output tokens
+                api_key=api_key,
+                logging_obj=logging,
+            )
+            if "stream" in optional_params and optional_params["stream"] == True:
+                # don't try to access stream object,
+                response = CustomStreamWrapper(
+                    response,
+                    model,
+                    custom_llm_provider="cloudflare",
+                    logging_obj=logging,
+                )
+
+            if optional_params.get("stream", False) or acompletion == True:
+                ## LOGGING
+                logging.post_call(
+                    input=messages,
+                    api_key=api_key,
+                    original_response=response,
+                )
+            response = response
         elif (
             custom_llm_provider == "baseten"
             or litellm.api_base == "https://app.baseten.co"
@@ -1775,6 +1820,7 @@ def batch_completion(
     user: Optional[str] = None,
     deployment_id=None,
     request_timeout: Optional[int] = None,
+    timeout: Optional[int] = 600,
     # Optional liteLLM function params
     **kwargs,
 ):
@@ -2426,22 +2472,22 @@ async def atext_completion(*args, **kwargs):
             or custom_llm_provider == "ollama"
             or custom_llm_provider == "vertex_ai"
         ):  # currently implemented aiohttp calls for just azure and openai, soon all.
-            if kwargs.get("stream", False):
-                response = text_completion(*args, **kwargs)
-            else:
-                # Await normally
-                response = await loop.run_in_executor(None, func_with_context)
-                if asyncio.iscoroutine(response):
-                    response = await response
+            # Await normally
+            response = await loop.run_in_executor(None, func_with_context)
+            if asyncio.iscoroutine(response):
+                response = await response
         else:
             # Call the synchronous function using run_in_executor
             response = await loop.run_in_executor(None, func_with_context)
-        if kwargs.get("stream", False):  # return an async generator
-            return _async_streaming(
-                response=response,
+        if kwargs.get("stream", False) == True:  # return an async generator
+            return TextCompletionStreamWrapper(
+                completion_stream=_async_streaming(
+                    response=response,
+                    model=model,
+                    custom_llm_provider=custom_llm_provider,
+                    args=args,
+                ),
                 model=model,
-                custom_llm_provider=custom_llm_provider,
-                args=args,
             )
         else:
             return response
@@ -2645,10 +2691,10 @@ def text_completion(
         **kwargs,
         **optional_params,
     )
+    if kwargs.get("acompletion", False) == True:
+        return response
     if stream == True or kwargs.get("stream", False) == True:
         response = TextCompletionStreamWrapper(completion_stream=response, model=model)
-        return response
-    if kwargs.get("acompletion", False) == True:
         return response
     transformed_logprobs = None
     # only supported for TGI models

@@ -4,7 +4,7 @@
 
 ### Pre-requisites
 Install redis
-```
+```shell
 pip install redis
 ```
 For the hosted version you can setup your own Redis DB here: https://app.redislabs.com/
@@ -18,20 +18,66 @@ litellm.cache = Cache(type="redis", host=<host>, port=<port>, password=<password
 # Make completion calls
 response1 = completion(
     model="gpt-3.5-turbo", 
-    messages=[{"role": "user", "content": "Tell me a joke."}],
-    caching=True
+    messages=[{"role": "user", "content": "Tell me a joke."}]
 )
 response2 = completion(
     model="gpt-3.5-turbo", 
-    messages=[{"role": "user", "content": "Tell me a joke."}],
-    caching=True
+    messages=[{"role": "user", "content": "Tell me a joke."}]
 )
 
 # response1 == response2, response 1 is cached
 ```
 
-### Custom Cache Keys:
+## Cache Context Manager - Enable, Disable, Update Cache
+Use the context manager for easily enabling, disabling & updating the litellm cache 
 
+### Enabling Cache
+
+Quick Start Enable
+```python
+litellm.enable_cache()
+```
+
+Advanced Params
+
+```python
+litellm.enable_cache(
+    type: Optional[Literal["local", "redis"]] = "local",
+    host: Optional[str] = None,
+    port: Optional[str] = None,
+    password: Optional[str] = None,
+    supported_call_types: Optional[
+        List[Literal["completion", "acompletion", "embedding", "aembedding"]]
+    ] = ["completion", "acompletion", "embedding", "aembedding"],
+    **kwargs,
+)
+```
+
+### Disabling Cache
+
+Switch caching off 
+```python
+litellm.disable_cache()
+```
+
+### Updating Cache Params (Redis Host, Port etc)
+
+Update the Cache params
+
+```python
+litellm.update_cache(
+    type: Optional[Literal["local", "redis"]] = "local",
+    host: Optional[str] = None,
+    port: Optional[str] = None,
+    password: Optional[str] = None,
+    supported_call_types: Optional[
+        List[Literal["completion", "acompletion", "embedding", "aembedding"]]
+    ] = ["completion", "acompletion", "embedding", "aembedding"],
+    **kwargs,
+)
+```
+
+## Custom Cache Keys:
 Define function to return cache key
 ```python
 # this function takes in *args, **kwargs and returns the key you want to use for caching

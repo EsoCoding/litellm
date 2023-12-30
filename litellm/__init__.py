@@ -44,6 +44,7 @@ huggingface_key: Optional[str] = None
 vertex_project: Optional[str] = None
 vertex_location: Optional[str] = None
 togetherai_api_key: Optional[str] = None
+cloudflare_api_key: Optional[str] = None
 baseten_key: Optional[str] = None
 aleph_alpha_key: Optional[str] = None
 nlp_cloud_key: Optional[str] = None
@@ -330,6 +331,15 @@ baseten_models: List = [
     "31dxrj3",
 ]  # FALCON 7B  # WizardLM  # Mosaic ML
 
+
+# used for token counting
+# Azure returns gpt-35-turbo in their responses, we need to map this to azure/gpt-3.5-turbo for token counting
+azure_llms = {
+    "gpt-35-turbo": "azure/gpt-3.5-turbo",
+    "gpt-35-turbo-16k": "azure/gpt-3.5-turbo-16k",
+    "gpt-35-turbo-instruct": "azure/gpt-3.5-turbo-instruct",
+}
+
 petals_models = [
     "petals-team/StableBeluga2",
 ]
@@ -390,6 +400,7 @@ provider_list: List = [
     "mistral",
     "maritalk",
     "voyage",
+    "cloudflare",
     "custom",  # custom apis
 ]
 
@@ -491,6 +502,7 @@ from .llms.replicate import ReplicateConfig
 from .llms.cohere import CohereConfig
 from .llms.ai21 import AI21Config
 from .llms.together_ai import TogetherAIConfig
+from .llms.cloudflare import CloudflareConfig
 from .llms.palm import PalmConfig
 from .llms.gemini import GeminiConfig
 from .llms.nlp_cloud import NLPCloudConfig

@@ -479,6 +479,8 @@ class EmbeddingResponse(OpenAIObject):
     usage: Optional[Usage] = None
     """Usage statistics for the embedding request."""
 
+    _hidden_params: dict = {}
+
     def __init__(
         self, model=None, usage=None, stream=False, response_ms=None, data=None
     ):
@@ -639,6 +641,8 @@ class ImageResponse(OpenAIObject):
     data: Optional[list] = None
 
     usage: Optional[dict] = None
+
+    _hidden_params: dict = {}
 
     def __init__(self, created=None, data=None, response_ms=None):
         if response_ms:
@@ -2053,6 +2057,10 @@ def client(original_function):
                 target=logging_obj.success_handler, args=(result, start_time, end_time)
             ).start()
             # RETURN RESULT
+            if hasattr(result, "_hidden_params"):
+                result._hidden_params["model_id"] = kwargs.get("model_info", {}).get(
+                    "id", None
+                )
             result._response_ms = (
                 end_time - start_time
             ).total_seconds() * 1000  # return response latency in ms like openai
@@ -2273,6 +2281,10 @@ def client(original_function):
                 target=logging_obj.success_handler, args=(result, start_time, end_time)
             ).start()
             # RETURN RESULT
+            if hasattr(result, "_hidden_params"):
+                result._hidden_params["model_id"] = kwargs.get("model_info", {}).get(
+                    "id", None
+                )
             if isinstance(result, ModelResponse):
                 result._response_ms = (
                     end_time - start_time
@@ -2350,6 +2362,7 @@ def client(original_function):
 def get_model_params_and_category(model_name):
     import re
 
+    model_name = model_name.lower()
     params_match = re.search(
         r"(\d+b)", model_name
     )  # catch all decimals like 3b, 70b, etc
@@ -2446,6 +2459,7 @@ def openai_token_counter(
     messages: Optional[list] = None,
     model="gpt-3.5-turbo-0613",
     text: Optional[str] = None,
+    is_tool_call: Optional[bool] = False,
 ):
     """
     Return the number of tokens used by a list of messages.
@@ -2465,21 +2479,27 @@ def openai_token_counter(
     elif model in litellm.open_ai_chat_completion_models:
         tokens_per_message = 3
         tokens_per_name = 1
+    elif model in litellm.azure_llms:
+        tokens_per_message = 3
+        tokens_per_name = 1
     else:
         raise NotImplementedError(
             f"""num_tokens_from_messages() is not implemented for model {model}. See https://github.com/openai/openai-python/blob/main/chatml.md for information on how messages are converted to tokens."""
         )
     num_tokens = 0
 
-    if text:
+    if is_tool_call and text is not None:
+        # if it's a tool call we assembled 'text' in token_counter()
         num_tokens = len(encoding.encode(text, disallowed_special=()))
-    elif messages:
+    elif messages is not None:
         for message in messages:
             num_tokens += tokens_per_message
             for key, value in message.items():
                 num_tokens += len(encoding.encode(value, disallowed_special=()))
                 if key == "name":
                     num_tokens += tokens_per_name
+    elif text is not None:
+        num_tokens = len(encoding.encode(text, disallowed_special=()))
     num_tokens += 3  # every reply is primed with <|start|>assistant<|message|>
     return num_tokens
 
@@ -2497,6 +2517,7 @@ def token_counter(model="", text=None, messages: Optional[List] = None):
     int: The number of tokens in the text.
     """
     # use tiktoken, anthropic, cohere or llama2's tokenizer depending on the model
+    is_tool_call = False
     if text == None:
         if messages is not None:
             print_verbose(f"token_counter messages received: {messages}")
@@ -2505,6 +2526,7 @@ def token_counter(model="", text=None, messages: Optional[List] = None):
                 if message.get("content", None):
                     text += message["content"]
                 if "tool_calls" in message:
+                    is_tool_call = True
                     for tool_call in message["tool_calls"]:
                         if "function" in tool_call:
                             function_arguments = tool_call["function"]["arguments"]
@@ -2518,8 +2540,13 @@ def token_counter(model="", text=None, messages: Optional[List] = None):
             enc = tokenizer_json["tokenizer"].encode(text)
             num_tokens = len(enc.ids)
         elif tokenizer_json["type"] == "openai_tokenizer":
-            if model in litellm.open_ai_chat_completion_models:
-                num_tokens = openai_token_counter(text=text, model=model)
+            if (
+                model in litellm.open_ai_chat_completion_models
+                or model in litellm.azure_llms
+            ):
+                num_tokens = openai_token_counter(
+                    text=text, model=model, messages=messages, is_tool_call=is_tool_call
+                )
             else:
                 enc = tokenizer_json["tokenizer"].encode(text)
                 num_tokens = len(enc)
@@ -2545,11 +2572,6 @@ def cost_per_token(model="", prompt_tokens=0, completion_tokens=0):
     completion_tokens_cost_usd_dollar = 0
     model_cost_ref = litellm.model_cost
     # see this https://learn.microsoft.com/en-us/azure/ai-services/openai/concepts/models
-    azure_llms = {
-        "gpt-35-turbo": "azure/gpt-3.5-turbo",
-        "gpt-35-turbo-16k": "azure/gpt-3.5-turbo-16k",
-        "gpt-35-turbo-instruct": "azure/gpt-3.5-turbo-instruct",
-    }
     if model in model_cost_ref:
         prompt_tokens_cost_usd_dollar = (
             model_cost_ref[model]["input_cost_per_token"] * prompt_tokens
@@ -2568,8 +2590,8 @@ def cost_per_token(model="", prompt_tokens=0, completion_tokens=0):
             * completion_tokens
         )
         return prompt_tokens_cost_usd_dollar, completion_tokens_cost_usd_dollar
-    elif model in azure_llms:
-        model = azure_llms[model]
+    elif model in litellm.azure_llms:
+        model = litellm.azure_llms[model]
         prompt_tokens_cost_usd_dollar = (
             model_cost_ref[model]["input_cost_per_token"] * prompt_tokens
         )
@@ -3397,6 +3419,15 @@ def get_optional_params(
             optional_params["n"] = n
         if stop is not None:
             optional_params["stop_sequences"] = stop
+    elif custom_llm_provider == "cloudflare":
+        # https://developers.cloudflare.com/workers-ai/models/text-generation/#input
+        supported_params = ["max_tokens", "stream"]
+        _check_valid_arg(supported_params=supported_params)
+
+        if max_tokens is not None:
+            optional_params["max_tokens"] = max_tokens
+        if stream is not None:
+            optional_params["stream"] = stream
     elif custom_llm_provider == "ollama":
         supported_params = [
             "max_tokens",
@@ -3558,14 +3589,24 @@ def get_optional_params(
             "frequency_penalty",
             "presence_penalty",
         ]
-        if model == "mistralai/Mistral-7B-Instruct-v0.1":
-            supported_params += ["functions", "function_call", "tools", "tool_choice"]
+        if model in [
+            "mistralai/Mistral-7B-Instruct-v0.1",
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        ]:
+            supported_params += [
+                "functions",
+                "function_call",
+                "tools",
+                "tool_choice",
+                "response_format",
+            ]
         _check_valid_arg(supported_params=supported_params)
         optional_params = non_default_params
         if temperature is not None:
-            if (
-                temperature == 0 and model == "mistralai/Mistral-7B-Instruct-v0.1"
-            ):  # this model does no support temperature == 0
+            if temperature == 0 and model in [
+                "mistralai/Mistral-7B-Instruct-v0.1",
+                "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            ]:  # this model does no support temperature == 0
                 temperature = 0.0001  # close to 0
             optional_params["temperature"] = temperature
         if top_p:
@@ -5680,6 +5721,23 @@ def exception_type(
                             response=original_exception.response,
                         )
                 # Dailed: Error occurred: 400 Request payload size exceeds the limit: 20000 bytes
+            elif custom_llm_provider == "cloudflare":
+                if "Authentication error" in error_str:
+                    exception_mapping_worked = True
+                    raise AuthenticationError(
+                        message=f"Cloudflare Exception - {original_exception.message}",
+                        llm_provider="cloudflare",
+                        model=model,
+                        response=original_exception.response,
+                    )
+                if "must have required property" in error_str:
+                    exception_mapping_worked = True
+                    raise BadRequestError(
+                        message=f"Cloudflare Exception - {original_exception.message}",
+                        llm_provider="cloudflare",
+                        model=model,
+                        response=original_exception.response,
+                    )
             elif custom_llm_provider == "cohere":  # Cohere
                 if (
                     "invalid api token" in error_str
@@ -6475,6 +6533,15 @@ class CustomStreamWrapper:
         self.special_tokens = ["<|assistant|>", "<|system|>", "<|user|>", "<s>", "</s>"]
         self.holding_chunk = ""
         self.complete_response = ""
+        _model_info = (
+            self.logging_obj.model_call_details.get("litellm_params", {}).get(
+                "model_info", {}
+            )
+            or {}
+        )
+        self._hidden_params = {
+            "model_id": (_model_info.get("id", None))
+        }  # returned as x-litellm-model-id response header in proxy
 
     def __iter__(self):
         return self
@@ -6892,6 +6959,36 @@ class CustomStreamWrapper:
             traceback.print_exc()
             return ""
 
+    def handle_cloudlfare_stream(self, chunk):
+        try:
+            print_verbose(f"\nRaw OpenAI Chunk\n{chunk}\n")
+            chunk = chunk.decode("utf-8")
+            str_line = chunk
+            text = ""
+            is_finished = False
+            finish_reason = None
+
+            if "[DONE]" in chunk:
+                return {"text": text, "is_finished": True, "finish_reason": "stop"}
+            elif str_line.startswith("data:"):
+                data_json = json.loads(str_line[5:])
+                print_verbose(f"delta content: {data_json}")
+                text = data_json["response"]
+                return {
+                    "text": text,
+                    "is_finished": is_finished,
+                    "finish_reason": finish_reason,
+                }
+            else:
+                return {
+                    "text": text,
+                    "is_finished": is_finished,
+                    "finish_reason": finish_reason,
+                }
+
+        except Exception as e:
+            raise e
+
     def handle_ollama_stream(self, chunk):
         try:
             if isinstance(chunk, dict):
@@ -7181,6 +7278,14 @@ class CustomStreamWrapper:
                     model_response.choices[0].finish_reason = response_obj[
                         "finish_reason"
                     ]
+            elif self.custom_llm_provider == "cloudflare":
+                response_obj = self.handle_cloudlfare_stream(chunk)
+                completion_obj["content"] = response_obj["text"]
+                print_verbose(f"completion obj content: {completion_obj['content']}")
+                if response_obj["is_finished"]:
+                    model_response.choices[0].finish_reason = response_obj[
+                        "finish_reason"
+                    ]
             elif self.custom_llm_provider == "text-completion-openai":
                 response_obj = self.handle_openai_text_completion_chunk(chunk)
                 completion_obj["content"] = response_obj["text"]
@@ -7189,7 +7294,11 @@ class CustomStreamWrapper:
                     model_response.choices[0].finish_reason = response_obj[
                         "finish_reason"
                     ]
-            else:  # openai chat model
+            else:  # openai / azure chat model
+                if self.custom_llm_provider == "azure":
+                    if hasattr(chunk, "model"):
+                        # for azure, we need to pass the model from the orignal chunk
+                        self.model = chunk.model
                 response_obj = self.handle_openai_chat_completion_chunk(chunk)
                 if response_obj == None:
                     return
@@ -7323,6 +7432,7 @@ class CustomStreamWrapper:
                     threading.Thread(
                         target=self.logging_obj.success_handler, args=(response,)
                     ).start()  # log response
+                    # RETURN RESULT
                     return response
         except StopIteration:
             raise  # Re-raise StopIteration

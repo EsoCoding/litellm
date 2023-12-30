@@ -306,7 +306,7 @@ class OpenAIChatCompletion(BaseLLM):
                             )
                         else:
                             openai_client = client
-                        response = openai_client.chat.completions.create(**data)  # type: ignore
+                        response = openai_client.chat.completions.create(**data, timeout=timeout)  # type: ignore
                         stringified_response = response.model_dump_json()
                         logging_obj.post_call(
                             input=messages,
@@ -382,7 +382,10 @@ class OpenAIChatCompletion(BaseLLM):
                     "complete_input_dict": data,
                 },
             )
-            response = await openai_aclient.chat.completions.create(**data)
+
+            response = await openai_aclient.chat.completions.create(
+                **data, timeout=timeout
+            )
             stringified_response = response.model_dump_json()
             logging_obj.post_call(
                 input=data["messages"],
@@ -430,7 +433,7 @@ class OpenAIChatCompletion(BaseLLM):
                 "complete_input_dict": data,
             },
         )
-        response = openai_client.chat.completions.create(**data)
+        response = openai_client.chat.completions.create(**data, timeout=timeout)
         streamwrapper = CustomStreamWrapper(
             completion_stream=response,
             model=model,
@@ -475,7 +478,9 @@ class OpenAIChatCompletion(BaseLLM):
                 },
             )
 
-            response = await openai_aclient.chat.completions.create(**data)
+            response = await openai_aclient.chat.completions.create(
+                **data, timeout=timeout
+            )
             streamwrapper = CustomStreamWrapper(
                 completion_stream=response,
                 model=model,
@@ -521,7 +526,7 @@ class OpenAIChatCompletion(BaseLLM):
                 )
             else:
                 openai_aclient = client
-            response = await openai_aclient.embeddings.create(**data)  # type: ignore
+            response = await openai_aclient.embeddings.create(**data, timeout=timeout)  # type: ignore
             stringified_response = response.model_dump_json()
             ## LOGGING
             logging_obj.post_call(
@@ -583,7 +588,7 @@ class OpenAIChatCompletion(BaseLLM):
                 openai_client = client
 
             ## COMPLETION CALL
-            response = openai_client.embeddings.create(**data)  # type: ignore
+            response = openai_client.embeddings.create(**data, timeout=timeout)  # type: ignore
             ## LOGGING
             logging_obj.post_call(
                 input=input,
@@ -628,7 +633,7 @@ class OpenAIChatCompletion(BaseLLM):
                 )
             else:
                 openai_aclient = client
-            response = await openai_aclient.images.generate(**data)  # type: ignore
+            response = await openai_aclient.images.generate(**data, timeout=timeout)  # type: ignore
             stringified_response = response.model_dump_json()
             ## LOGGING
             logging_obj.post_call(
@@ -637,7 +642,7 @@ class OpenAIChatCompletion(BaseLLM):
                 additional_args={"complete_input_dict": data},
                 original_response=stringified_response,
             )
-            return convert_to_model_response_object(response_object=json.loads(stringified_response), model_response_object=model_response, response_type="embedding")  # type: ignore
+            return convert_to_model_response_object(response_object=json.loads(stringified_response), model_response_object=model_response, response_type="image_generation")  # type: ignore
         except Exception as e:
             ## LOGGING
             logging_obj.post_call(
@@ -668,9 +673,9 @@ class OpenAIChatCompletion(BaseLLM):
             if not isinstance(max_retries, int):
                 raise OpenAIError(status_code=422, message="max retries must be an int")
 
-            # if aembedding == True:
-            #     response =  self.aembedding(data=data, input=input, logging_obj=logging_obj, model_response=model_response, api_base=api_base, api_key=api_key, timeout=timeout, client=client, max_retries=max_retries) # type: ignore
-            #     return response
+            if aimg_generation == True:
+                response = self.aimage_generation(data=data, prompt=prompt, logging_obj=logging_obj, model_response=model_response, api_base=api_base, api_key=api_key, timeout=timeout, client=client, max_retries=max_retries)  # type: ignore
+                return response
 
             if client is None:
                 openai_client = OpenAI(
@@ -696,7 +701,7 @@ class OpenAIChatCompletion(BaseLLM):
             )
 
             ## COMPLETION CALL
-            response = openai_client.images.generate(**data)  # type: ignore
+            response = openai_client.images.generate(**data, timeout=timeout)  # type: ignore
             ## LOGGING
             logging_obj.post_call(
                 input=input,

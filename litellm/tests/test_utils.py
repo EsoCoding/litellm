@@ -316,4 +316,4 @@ def test_token_counter():
         pytest.fail(f"Error occurred: {e}")
 
 
-test_token_counter()
+# test_token_counter()
